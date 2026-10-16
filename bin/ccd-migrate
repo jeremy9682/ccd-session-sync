@@ -59,9 +59,9 @@ case "$cmd" in
   undo)
     stage
     g diff --cached --quiet || g commit -q -m "drift: app-side changes before undo"
-    mig=$(g log --pretty='%H %s' -30 | awk '$2=="migrate:"{print $1; exit}')
+    mig=$(g log --grep='^migrate:' --format=%H -1)
     if [ -z "$mig" ]; then
-      echo "no 'migrate:' commit in the last 30 — nothing to undo. Revert a specific commit manually:" >&2
+      echo "no 'migrate:' commit found — nothing to undo. Revert a specific commit manually:" >&2
       echo "  git --git-dir=\"$GD\" --work-tree=\"$WT\" revert <hash>" >&2
       exit 1
     fi
