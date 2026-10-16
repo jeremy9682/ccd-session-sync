@@ -1,0 +1,382 @@
+--- a/README.md
++++ b/README.md
+@@ -101,7 +101,7 @@
+ - **Unofficial / version‑sensitive.** Operates on Claude Desktop's *internal, undocumented* file layout. A future app update could change it and break this tool — worst case it errors out; your data is untouched and git‑backed. No schema/version detection. Not affiliated with or endorsed by Anthropic; no warranty; you are responsible for your own backups and for compliance with Claude's terms.
+ - **Heuristic direction.** Destination = current account; source = most‑recently‑active other account. With 3+ accounts, or an account that has more than one org directory, it warns and picks the newest — **always `--dry-run` first**, and use `CCD_FROM=/CCD_TO=` to force direction.
+ - **`undo`** reverts the most recent `migrate:` commit (not necessarily the very last operation) and can conflict if you edited things after; for surgical rollback use `ccd-migrate log` + `git … revert <hash>`.
+-- **Deletion intent**: in the selected `claude-code-sessions` destination account/org, a `deleted_<session-id>` or `deleted_<cliSessionId>` marker suppresses both NEW and UPD copies. Marker presence wins, even for an empty/malformed timestamp or a newer source. Markers are preserved; source markers never delete other accounts or archives. An existing destination index's transcript ID is also checked before an update. This policy does not infer deletion markers for the separate Cowork/local-agent payload format. A symlink/special-file marker blocks the operation. `.tombstones` remains a separate, hand-maintained global filename list. This naming is reported for Desktop 2.42304.0 and is not a stable public API; real UI compatibility has not been tested.
++- **Deletion intent**: in the selected destination account/org, a `deleted_<session-id>` or `deleted_<cliSessionId>` marker suppresses both NEW and UPD copies. Marker presence wins, even for an empty/malformed timestamp or a newer source. Markers are preserved; source markers never delete other accounts or archives. A symlink/special-file marker blocks the operation. `.tombstones` remains a separate, hand-maintained global filename list. This naming is reported for Desktop 2.42304.0 and is not a stable public API; real UI compatibility has not been tested.
+ - **Writes are not transactional** — each JSON copy is atomically replaced, but a multi-file operation can stop midway. A persistent `ccd-operation.json` journal and exclusive `ccd.lock.d` block retries after failures/interruption. Keep the app quit: these checks cannot prevent simultaneous Desktop or same-user filesystem races.
+ - The sidebar's project grouping is derived from repo/PR metadata; this tool does **not** rewrite `originCwd` (load‑bearing for worktree/PR features). Sessions group under whatever project directory they actually ran in.
+ - macOS only (uses `launchd` + `osascript`).
+@@ -112,12 +112,10 @@
+ 
+ ## Conservative mutation checks
+ 
+-`ccd-migrate`, `undo`, and `snapshot` refuse existing Git conflicts, in-progress revert/merge/cherry-pick/rebase, a retained operation journal, pre-staged changes, malformed or non-UTF-8/BOM-prefixed index JSON, assume-unchanged/skip-worktree index flags, unsupported tracked paths, symlinks/hardlinks/special files, and custom Git filters/attributes. Checks cover every account/org index in this registry, so an invalid unrelated account index may block an operation. JSON objects with duplicate keys or non-finite numbers are refused. Missing/null `cliSessionId` uses filename-ID deletion markers only; nonempty IDs must be safe single filename components. Extra unknown arguments are rejected.
++`ccd-migrate`, `undo`, and `snapshot` refuse existing Git conflicts, in-progress revert/merge/cherry-pick/rebase, a retained operation journal, pre-staged changes, malformed index JSON, unsupported tracked paths, symlinks/hardlinks/special files, and custom Git filters/attributes. Checks cover every account/org index in this registry, so an invalid unrelated account index may block an operation. JSON objects with duplicate keys or non-finite numbers are refused. Missing/null `cliSessionId` uses filename-ID deletion markers only; nonempty IDs must be safe single filename components. Extra unknown arguments are rejected.
+ 
+-The safety helper `ccd-safety.py` is installed next to `ccd-migrate`. Git hooks, signing, fsmonitor, global/system configuration and global/system attributes are disabled for tool operations; automatic line-ending conversion is disabled. Existing installation refresh uses the same preflight, lock, journal and path-limited staging. Concrete LaunchAgent output files are checked for symlinks/hardlinks before any installation mutation. Registry completion clears the journal before optional agent setup, so agent setup failures do not block an otherwise valid registry. Overrides must be absolute paths; custom registry paths require `install.sh --no-agents` because the launchd templates use default paths. The tool snapshots ordinary app-side drift only after validation and selection; an invalid/no-op undo does not first commit drift. Unrelated, untracked files outside the recognized index paths are preserved. Untracked `.DS_Store` files are tolerated and never staged; other unexpected session-tree files and hardlinks (including payload hardlinks) cause a conservative stop.
++The safety helper `ccd-safety.py` is installed next to `ccd-migrate`. Git hooks and fsmonitor are disabled for tool operations. The tool snapshots ordinary app-side drift only after validation and selection; an invalid/no-op undo does not first commit drift. Unrelated, untracked files outside the recognized index paths are preserved.
+ 
+ If an operation stops, **do not immediately delete the lock/journal or retry**. Quit Desktop and inspect `ccd-migrate status`, Git status/diff, and the journal with an experienced maintainer. Preserve a copy of the affected index files and Git repository before any manual recovery. Recovery must decide whether partial copies or Git state should be retained or reverted; the tool never automatically resets, aborts, or discards edits. A stale lock after a killed process requires the same inspection.
+ 
+-Account/org prefix collisions in an undo target are refused. Org names must have a prefix representable in the generated history summary; literal glob metacharacters in paths are never expanded while selecting directories.
+-
+ Undo identifies migration intent from a subject plus a validated patch. This is not authentication: deliberately forged history that is byte-for-byte indistinguishable from a legitimate migration cannot be detected. Unsupported/suspicious history stops rather than falling back to an older migration. Git does not restore original modification times during undo; later newer-wins decisions may be affected. This repair does not change payload-directory rollback: copied payload directories remain additive and untracked.
+--- a/bin/ccd-migrate
++++ b/bin/ccd-migrate
+@@ -17,15 +17,12 @@
+ # Overrides (when >2 accounts, or to force direction):
+ #   CCD_FROM=<acct-uuid-prefix> CCD_TO=<acct-uuid-prefix> ccd-migrate
+ set -euo pipefail
+-# Tool-local Git policy: no global filters, attribute conversions or injected config.
+-export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1
+-unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_ATTR_SOURCE
+ 
+ GD="${CCD_GIT_DIR:-$HOME/.ccd-sessions-git}"
+ WT="${CCD_CLAUDE_DIR:-$HOME/Library/Application Support/Claude}"
+ SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+ safety() { python3 -I "$SELF_DIR/ccd-safety.py" "$GD" "$WT" "$@"; }
+-g() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c log.showSignature=false -c commit.gpgsign=false -c diff.external= -c core.attributesFile=/dev/null -c core.autocrlf=false --git-dir="$GD" --work-tree="$WT" "$@"; }
++g() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c log.showSignature=false -c commit.gpgsign=false -c diff.external= --git-dir="$GD" --work-tree="$WT" "$@"; }
+ LOCK="$GD/ccd.lock.d"
+ JOURNAL="$GD/ccd-operation.json"
+ begin_operation() {
+@@ -118,10 +115,9 @@
+     echo "owner: $(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]+"/cowork-enabled-cli-ops.json"))["ownerAccountId"])' "$WT" 2>/dev/null || echo '(unknown)')"
+     python3 -I - "$WT" <<'PY'
+ import glob, os, sys, time
+-from pathlib import Path
+ WT = sys.argv[1]
+-for org in sorted(str(p) for p in (Path(WT)/'claude-code-sessions').glob('*/*') if p.is_dir()):
+-    fs = list(Path(org).glob('local_*.json'))
++for org in sorted(glob.glob(os.path.join(WT, 'claude-code-sessions', '*', '*'))):
++    fs = glob.glob(os.path.join(org, 'local_*.json'))
+     newest = max((os.path.getmtime(f) for f in fs), default=0)
+     ts = time.strftime('%m-%d %H:%M', time.localtime(newest)) if newest else 'empty'
+     print(f"  {len(fs):>3} entries | newest {ts} | {'/'.join(org.split('/')[-2:])}")
+@@ -147,10 +143,9 @@
+ # 2) plan + copy (tombstone-aware, newer-wins); python prints SUMMARY line last
+ OUT=$(DRY=$DRY CCD_FROM="${CCD_FROM:-}" CCD_TO="${CCD_TO:-}" python3 -I - "$WT" <<'PY'
+ import glob, json, os, re, shutil, sys, time, tempfile
+-from pathlib import Path
+ WT = sys.argv[1]; DRY = os.environ.get('DRY') == '1'
+ CCS = os.path.join(WT, 'claude-code-sessions'); LAM = os.path.join(WT, 'local-agent-mode-sessions')
+-UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f-]+$')
++UUID = re.compile(r'^[0-9a-f]{8}-')
+ try:
+     owner = json.load(open(os.path.join(WT, 'cowork-enabled-cli-ops.json')))['ownerAccountId']
+ except Exception as e:
+@@ -171,13 +166,12 @@
+         finally: os.close(directory)
+     finally:
+         if os.path.exists(tmp): os.unlink(tmp)
+-def index_files(org): return [str(p) for p in Path(org).glob('local_*.json') if p.is_file()]
+-def newest(org): return max((os.path.getmtime(f) for f in index_files(org)), default=0)
+-def orgs(acct): return [str(p) for p in (Path(CCS)/acct).iterdir() if p.is_dir()]
++def newest(org): return max((os.path.getmtime(f) for f in glob.glob(os.path.join(org, 'local_*.json'))), default=0)
++def orgs(acct): return [d for d in glob.glob(os.path.join(CCS, acct, '*')) if os.path.isdir(d)]
+ def pick(acct_filter, label):
+     cands = []
+     for a in os.listdir(CCS):
+-        if not UUID.fullmatch(a) or not acct_filter(a): continue
++        if not UUID.match(a) or not acct_filter(a): continue
+         cands += orgs(a)
+     if not cands: sys.exit(f"ERROR: no {label} account dir found under claude-code-sessions")
+     return max(cands, key=newest)
+@@ -188,7 +182,7 @@
+ src = pick((lambda a: a.startswith(FROM)) if FROM else (lambda a: a != dst_acct), 'source')
+ if os.path.dirname(src) == os.path.dirname(dst): sys.exit("ERROR: src and dst are the same account (need a second account dir to migrate from)")
+ if not FROM:
+-    others = {a for a in os.listdir(CCS) if UUID.fullmatch(a) and a != dst_acct}
++    others = {a for a in os.listdir(CCS) if UUID.match(a) and a != dst_acct}
+     if len(others) > 1:
+         print(f"NOTE: {len(others)} non-destination accounts present; auto-picked {os.path.basename(os.path.dirname(src))[:8]} (newest activity). Override with CCD_FROM=<uuid-prefix>.")
+ for role, d in (('destination', dst), ('source', src)):
+@@ -198,24 +192,23 @@
+ 
+ tomb = set()
+ tf = os.path.join(CCS, '.tombstones')
+-if os.path.exists(tf): tomb = {l.strip() for l in open(tf, encoding='utf-8') if l.strip()}
++if os.path.exists(tf): tomb = {l.strip() for l in open(tf) if l.strip()}
+ 
+ new = upd = skip_t = skip_d = 0
+-for f in sorted(index_files(src)):
++for f in sorted(glob.glob(os.path.join(src, 'local_*.json'))):
+     b = os.path.basename(f); d = os.path.join(dst, b)
+     if b in tomb: skip_t += 1; continue
+     # Desktop markers are opaque intent. Presence wins; never delete or copy
+     # markers, and never interpret a source deletion as a target deletion.
+-    entry = json.load(open(f, encoding='utf-8'))
++    entry = json.load(open(f))
+     ids = [b[len('local_'):-len('.json')], entry.get('cliSessionId')]
+-    if os.path.isfile(d): ids.append(json.load(open(d, encoding='utf-8')).get('cliSessionId'))
+     if any(os.path.lexists(os.path.join(dst, 'deleted_' + ident)) for ident in ids if ident):
+         skip_d += 1; continue
+     if not os.path.exists(d): act, new = 'NEW', new + 1
+     elif os.path.getmtime(f) > os.path.getmtime(d) + 1: act, upd = 'UPD', upd + 1
+     else: continue
+     if DRY:
+-        try: t = json.dumps(entry.get('title') or '(no title)', ensure_ascii=True)
++        try: t = json.load(open(f)).get('title') or '(no title)'
+         except Exception: t = '(unparsable)'
+         print(f"  {act} {b[:22]}… {t[:48]}")
+     else: atomic_copy(f, d)
+--- a/bin/ccd-migrate-auto
++++ b/bin/ccd-migrate-auto
+@@ -19,7 +19,7 @@
+ fi
+ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+ 
+-owner=$(/usr/bin/python3 -I -c "import json,sys;print(json.load(open(sys.argv[1]))['ownerAccountId'])" "$OPS" 2>/dev/null) || exit 0
++owner=$(/usr/bin/python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['ownerAccountId'])" "$OPS" 2>/dev/null) || exit 0
+ prev=$(cat "$STATE" 2>/dev/null || echo "")
+ if [ -z "$prev" ]; then                      # first run / no state: seed and exit, never auto-migrate blindly
+   echo "$owner" > "$STATE"; echo "$(ts) seeded last-owner=$owner (first run — no migrate)" >> "$LOG"; exit 0
+--- a/bin/ccd-safety.py
++++ b/bin/ccd-safety.py
+@@ -58,10 +58,6 @@
+             result[key] = value
+         return result
+     try:
+-        if isinstance(data, bytes):
+-            data = data.decode('utf-8')
+-        if data.startswith('\ufeff'):
+-            fail(f'UTF-8 BOM is not supported: {label}')
+         value = json.loads(data, object_pairs_hook=pairs,
+                            parse_constant=lambda s: fail(f'non-finite JSON: {label}'))
+     except (ValueError, UnicodeError) as e:
+@@ -78,12 +74,9 @@
+ 
+ 
+ def git(*args, ok=(0,), data=None):
+-    env = dict(os.environ, GIT_OPTIONAL_LOCKS='0', GIT_LITERAL_PATHSPECS='1',
+-               GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1', GIT_ATTR_NOSYSTEM='1')
+-    for key in ('GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_ATTR_SOURCE'):
+-        env.pop(key, None)
++    env = dict(os.environ, GIT_OPTIONAL_LOCKS='0', GIT_LITERAL_PATHSPECS='1')
+     p = subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false',
+-                        '-c', 'log.showSignature=false', '-c', 'diff.external=', '-c', 'commit.gpgsign=false', '-c', 'core.attributesFile=/dev/null', '-c', 'core.autocrlf=false',
++                        '-c', 'log.showSignature=false', '-c', 'diff.external=', '-c', 'commit.gpgsign=false',
+                         '--git-dir='+str(GD), '--work-tree='+str(WT), *args],
+                        input=data, capture_output=True, env=env, cwd=WT)
+     if p.returncode not in ok:
+@@ -101,12 +94,12 @@
+             and len(parts[3]) > len('local_.json'))
+ 
+ 
+-def guard(allow_empty=False):
++def guard():
+     global GD, WT
+     if not GD.is_absolute() or not WT.is_absolute():
+         fail('CCD_GIT_DIR and CCD_CLAUDE_DIR must be absolute paths')
+     GD, WT = no_links(GD), no_links(WT)
+-    if (not GD.is_dir() and not allow_empty) or (GD.exists() and not GD.is_dir()) or not (WT/'claude-code-sessions').is_dir():
++    if not GD.is_dir() or not (WT/'claude-code-sessions').is_dir():
+         fail('git repo or session root missing; run installer first')
+     if GD == WT or GD in WT.parents or WT in GD.parents:
+         fail('Git directory and data directory must be disjoint')
+@@ -130,20 +123,15 @@
+                  'ccd-operation.json', 'commondir', 'objects/info/alternates'):
+         if (GD/name).exists():
+             fail(f'pending operation or unsupported state: {name}; inspect manually, no automatic recovery')
+-    if GD.is_dir():
+-        if git('ls-files', '-u', '-z'):
+-            fail('unmerged Git entries; resolve manually before any mutation')
+-        if git('diff', '--cached', '--name-only', '-z'):
+-            fail('pre-staged changes; preserve and review them before running ccd-migrate')
+-        risky = git('config', '--local', '--name-only', '--get-regexp',
+-                    r'^(filter\.|include\.|includeIf\.|core\.attributesfile|core\.sshCommand|extensions\.)', ok=(0, 1))
+-        if risky:
+-            fail('custom repository filters/includes/extensions require manual review')
+-        flags = git('ls-files', '-v', '-z').split(b'\0')
+-        if any(row and (row[:1] == b'S' or b'a' <= row[:1] <= b'z') for row in flags):
+-            fail('assume-unchanged/skip-worktree index flags require manual review')
+-        if not allow_empty:
+-            git('rev-parse', '--verify', 'HEAD')
++    if git('ls-files', '-u', '-z'):
++        fail('unmerged Git entries; resolve manually before any mutation')
++    if git('diff', '--cached', '--name-only', '-z'):
++        fail('pre-staged changes; preserve and review them before running ccd-migrate')
++    risky = git('config', '--local', '--name-only', '--get-regexp',
++                r'^(filter\.|include\.|includeIf\.|core\.attributesfile|core\.sshCommand|extensions\.)', ok=(0, 1))
++    if risky:
++        fail('custom repository filters/includes/extensions require manual review')
++    git('rev-parse', '--verify', 'HEAD')
+     ops = WT/'cowork-enabled-cli-ops.json'
+     if ops.exists():
+         if not ops.is_file() or ops.stat().st_nlink != 1:
+@@ -152,7 +140,7 @@
+         if not component(owner):
+             fail('invalid ownerAccountId')
+     for root in ('claude-code-sessions', 'local-agent-mode-sessions'):
+-        for p in (WT/root).glob('*/*/local_*.json'):
++        for p in (WT/root).glob('*/*/*.json'):
+             if p.name == 'cowork-gb-cache.json':
+                 continue
+             if not p.is_file():
+@@ -160,31 +148,20 @@
+             if p.stat().st_mode & 0o111:
+                 fail(f'executable index file requires manual review: {p}')
+             json_object(p.read_bytes(), str(p))
+-    for root in ('claude-code-sessions', 'local-agent-mode-sessions'):
+-        for p in (WT/root).glob('*/*/local_*.json'):
+-            if not allowed_index(str(p.relative_to(WT))):
+-                fail(f'unsupported index path: {p}')
++    for p in (WT/'claude-code-sessions').glob('*/*/local_*.json'):
++        if not allowed_index(str(p.relative_to(WT))):
++            fail(f'unsupported index path: {p}')
+     for p in (WT/'claude-code-sessions').glob('*/*/deleted_*'):
+         if not p.is_file() or not component(p.name[8:]):
+             fail(f'unsupported deletion marker: {p}')
+-    tombstones = WT/'claude-code-sessions/.tombstones'
+-    if tombstones.exists():
+-        if not tombstones.is_file():
+-            fail('tombstones list must be a regular UTF-8 file')
+-        try:
+-            tombstones.read_text(encoding='utf-8')
+-        except UnicodeError:
+-            fail('tombstones list must be UTF-8')
+     for p in (WT/'claude-code-sessions').rglob('*'):
+         if p.is_file():
+-            if p.name == '.DS_Store':
+-                continue  # Finder metadata is never staged.
+             rel = p.relative_to(WT)
+             if not (allowed_index(str(rel)) or str(rel) == 'claude-code-sessions/.tombstones'
+                     or (len(rel.parts) == 4 and p.name.startswith('deleted_') and component(p.name[8:]))):
+                 fail(f'unsupported file in staged session tree: {p}')
+     # Never stage arbitrary files or payloads from a compromised tracked history.
+-    tracked = git('ls-files', '-z').split(b'\0') if GD.is_dir() else []
++    tracked = git('ls-files', '-z').split(b'\0')
+     for raw in filter(None, tracked):
+         path = os.fsdecode(raw)
+         parts = Path(path).parts
+@@ -259,12 +236,6 @@
+             fail('partial or combined inverse changes after migration; inspect manually')
+         if migration in body and ('revert' in body.lower() or 'undo' in body.lower()):
+             fail('ambiguous undo reference in later history; inspect manually')
+-    destinations = {(Path(row[0]).parts[1], Path(row[0]).parts[2]) for row in rows}
+-    matching = {(a.name, o.name) for a in (WT/'claude-code-sessions').iterdir()
+-                if a.is_dir() and a.name[:8] == match[3]
+-                for o in a.iterdir() if o.is_dir() and o.name[:8] == match[4]}
+-    if len(destinations) != 1 or matching != destinations:
+-        fail('destination account/org prefix is ambiguous; inspect full paths manually')
+     touched = [r[0] for r in rows]
+     if git('diff', '--name-only', '-z', '--no-ext-diff', '--no-textconv', '--', *touched):
+         fail('undo target has uncommitted edits; preserve and inspect them manually')
+@@ -291,16 +262,7 @@
+         for i in range(0, len(paths), 200):
+             git('add', '-A', '--', *paths[i:i+200])
+         return
+-    guard(allow_empty=action == 'preinstall')
+-    if action == 'preinstall':
+-        if not (WT/'cowork-enabled-cli-ops.json').is_file():
+-            fail('owner metadata missing; refusing installation before any mutation')
+-        for i, path in enumerate(sys.argv[4:]):
+-            p = no_links(Path(path))
+-            if p.exists() and (p.is_dir() if i < 3 else p.is_file()) is False:
+-                fail(f'unexpected install target type: {p}')
+-            if p.exists() and p.is_file() and p.stat().st_nlink != 1:
+-                fail(f'hard-linked install target: {p}')
++    guard()
+     if action == 'undo':
+         undo_candidate()
+     elif action == 'plan':
+--- a/install.sh
++++ b/install.sh
+@@ -3,15 +3,11 @@
+ # Idempotent. Env overrides: CCD_BIN (default ~/bin), CCD_ARCHIVE (default ~/ClaudeArchive).
+ # Flags: --no-agents (install scripts + git repo only, skip launchd), --dry-run (print, do nothing).
+ set -euo pipefail
+-export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1
+-unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_ATTR_SOURCE
+-safe_git() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c commit.gpgsign=false -c core.attributesFile=/dev/null -c core.autocrlf=false "$@"; }
+-
+ 
+ REPO_SRC="$(cd "$(dirname "$0")" && pwd)"
+ BIN="${CCD_BIN:-$HOME/bin}"
+-GD="${CCD_GIT_DIR:-$HOME/.ccd-sessions-git}"
+-WT="${CCD_CLAUDE_DIR:-$HOME/Library/Application Support/Claude}"
++GD="$HOME/.ccd-sessions-git"
++WT="$HOME/Library/Application Support/Claude"
+ ARCHIVE="${CCD_ARCHIVE:-$HOME/ClaudeArchive}"
+ LA="$HOME/Library/LaunchAgents"
+ DRY=0; AGENTS=1
+@@ -25,39 +21,10 @@
+ run() { echo "+ $*"; [ "$DRY" = 1 ] || "$@"; }
+ 
+ echo "== preflight =="
+-if [ "$AGENTS" = 1 ] && { [ "$GD" != "$HOME/.ccd-sessions-git" ] || [ "$WT" != "$HOME/Library/Application Support/Claude" ]; }; then
+-  echo "ERROR: custom registry paths require --no-agents; launchd templates use default paths" >&2; exit 2
+-fi
+ [ "$(uname)" = "Darwin" ] || { echo "ERROR: macOS only." >&2; exit 1; }
+ for t in git python3 rsync; do command -v "$t" >/dev/null || { echo "ERROR: '$t' not found in PATH." >&2; exit 1; }; done
+ [ -d "$WT/claude-code-sessions" ] || { echo "ERROR: '$WT/claude-code-sessions' not found. Install & launch Claude Desktop once, then re-run." >&2; exit 1; }
+ case ":$PATH:" in *":$BIN:"*) : ;; *) echo "WARNING: $BIN is not on your PATH — add it to ~/.zshrc: export PATH=\"$BIN:\$PATH\"";; esac
+-
+-# Validate existing data/recovery state before changing installed files or Git.
+-python3 -I "$REPO_SRC/bin/ccd-safety.py" "$GD" "$WT" preinstall "$BIN" "$ARCHIVE/claude-projects" "$LA" "$BIN/ccd-migrate" "$BIN/ccd-migrate-auto" "$BIN/claude-archive-sync" "$BIN/claude-second" "$BIN/ccd-safety.py" "$LA/com.ccd-session-sync.migrate-auto.plist" "$LA/com.ccd-session-sync.projects-archive.plist"
+-if [ -e "$GD/ccd.lock.d" ]; then echo "ERROR: existing operation lock; inspect manually" >&2; exit 1; fi
+-if [ "$DRY" = 0 ]; then
+-  if [ ! -d "$GD" ]; then
+-    safe_git init --bare "$GD" >/dev/null
+-    safe_git --git-dir="$GD" config core.bare false
+-    safe_git --git-dir="$GD" config user.name ccd-session-sync
+-    safe_git --git-dir="$GD" config user.email ccd-session-sync@localhost
+-  fi
+-  mkdir "$GD/ccd.lock.d" || exit 1
+-  trap 'rmdir "$GD/ccd.lock.d" 2>/dev/null || true' EXIT
+-  trap 'exit 130' INT
+-  trap 'exit 143' TERM
+-  python3 -I "$REPO_SRC/bin/ccd-safety.py" "$GD" "$WT" preinstall
+-  python3 -I - "$GD/ccd-operation.json" <<'PY_INSTALL_JOURNAL'
+-import json, os, sys
+-with open(sys.argv[1], 'x') as f:
+-    json.dump({'command':'install','pid':os.getppid(),'recovery':'manual inspection required'}, f)
+-    f.flush(); os.fsync(f.fileno())
+-fd = os.open(os.path.dirname(sys.argv[1]), os.O_RDONLY)
+-try: os.fsync(fd)
+-finally: os.close(fd)
+-PY_INSTALL_JOURNAL
+-fi
+ 
+ echo "== install scripts -> $BIN =="
+ run mkdir -p "$BIN"
+@@ -72,6 +39,14 @@
+ if [ "$DRY" = 1 ]; then
+   echo "+ (dry-run) init/refresh $GD, refresh info/exclude, seed last-owner, baseline commit"
+ else
++  if [ ! -d "$GD" ]; then
++    git init --bare "$GD" >/dev/null
++    git --git-dir="$GD" config core.bare false
++    git --git-dir="$GD" config user.name ccd-session-sync
++    git --git-dir="$GD" config user.email ccd-session-sync@localhost
++  else
++    echo "repo already exists — leaving history intact, refreshing config"
++  fi
+   # always (re)write the tracking whitelist so upgrades pick up changes
+   cat > "$GD/info/exclude" <<'EOF'
+ *
+@@ -89,16 +64,11 @@
+ EOF
+   # create the tombstones list only if absent — never truncate one the user maintains
+   [ -f "$WT/claude-code-sessions/.tombstones" ] || : > "$WT/claude-code-sessions/.tombstones"
+-  python3 -I "$REPO_SRC/bin/ccd-safety.py" "$GD" "$WT" stage
+-  rc=0; safe_git --git-dir="$GD" --work-tree="$WT" diff --cached --quiet || rc=$?
+-  if [ "$rc" -gt 1 ]; then exit "$rc"; fi
+-  if [ "$rc" = 1 ]; then
+-    safe_git --git-dir="$GD" --work-tree="$WT" commit -q -m "install: baseline/refresh session registries"
+-  else echo "(nothing to commit)"; fi
+-  # Seed only after complete validation; do not import modules from the caller cwd.
+-  python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]+"/cowork-enabled-cli-ops.json"))["ownerAccountId"])' "$WT" > "$GD/last-owner"
+-  rm -- "$GD/ccd-operation.json"
+-
++  gadd=""; for p in claude-code-sessions local-agent-mode-sessions cowork-enabled-cli-ops.json; do [ -e "$WT/$p" ] && gadd="$gadd $p"; done
++  [ -n "$gadd" ] && git --git-dir="$GD" --work-tree="$WT" add -A -- $gadd
++  git --git-dir="$GD" --work-tree="$WT" commit -q -m "install: baseline/refresh session registries" || echo "(nothing to commit)"
++  # (re)seed auto-migrate state on EVERY install so a reinstall never fires a stale-owner migration
++  python3 -c 'import json,sys;print(json.load(open(sys.argv[1]+"/cowork-enabled-cli-ops.json"))["ownerAccountId"])' "$WT" > "$GD/last-owner" 2>/dev/null || true
+ fi
+ 
+ echo "== archive dir -> $ARCHIVE =="
