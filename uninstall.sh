@@ -11,7 +11,7 @@ for base in com.ccd-session-sync.migrate-auto com.ccd-session-sync.projects-arch
   launchctl bootout "gui/$(id -u)/$base" 2>/dev/null || true
   rm -f "$LA/$base.plist"
 done
-rm -f "$BIN/ccd-migrate" "$BIN/ccd-migrate-auto" "$BIN/claude-archive-sync" "$BIN/claude-second"
+rm -f "$BIN/ccd-migrate" "$BIN/ccd-migrate-auto" "$BIN/claude-archive-sync" "$BIN/claude-second" "$BIN/ccd-safety.py"
 echo "removed agents + scripts."
 
 if [ "$PURGE" = 1 ]; then

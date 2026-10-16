@@ -19,7 +19,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then         # another instance is running
 fi
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
-owner=$(/usr/bin/python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['ownerAccountId'])" "$OPS" 2>/dev/null) || exit 0
+owner=$(/usr/bin/python3 -I -c "import json,sys;print(json.load(open(sys.argv[1]))['ownerAccountId'])" "$OPS" 2>/dev/null) || exit 0
 prev=$(cat "$STATE" 2>/dev/null || echo "")
 if [ -z "$prev" ]; then                      # first run / no state: seed and exit, never auto-migrate blindly
   echo "$owner" > "$STATE"; echo "$(ts) seeded last-owner=$owner (first run — no migrate)" >> "$LOG"; exit 0

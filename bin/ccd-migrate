@@ -17,19 +17,41 @@
 # Overrides (when >2 accounts, or to force direction):
 #   CCD_FROM=<acct-uuid-prefix> CCD_TO=<acct-uuid-prefix> ccd-migrate
 set -euo pipefail
+# Tool-local Git policy: no global filters, attribute conversions or injected config.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1
+unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_ATTR_SOURCE
 
 GD="${CCD_GIT_DIR:-$HOME/.ccd-sessions-git}"
 WT="${CCD_CLAUDE_DIR:-$HOME/Library/Application Support/Claude}"
-g() { git --git-dir="$GD" --work-tree="$WT" "$@"; }
-# stage only the tracked paths that actually exist (users without Cowork have no
-# local-agent-mode-sessions dir; a non-matching pathspec would abort under `set -e`).
-stage() {
-  local p ps=""
-  for p in claude-code-sessions local-agent-mode-sessions cowork-enabled-cli-ops.json; do
-    [ -e "$WT/$p" ] && ps="$ps $p"
-  done
-  [ -n "$ps" ] && g add -A -- $ps || true
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+safety() { python3 -I "$SELF_DIR/ccd-safety.py" "$GD" "$WT" "$@"; }
+g() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c log.showSignature=false -c commit.gpgsign=false -c diff.external= -c core.attributesFile=/dev/null -c core.autocrlf=false --git-dir="$GD" --work-tree="$WT" "$@"; }
+LOCK="$GD/ccd.lock.d"
+JOURNAL="$GD/ccd-operation.json"
+begin_operation() {
+  # Exclusive creation; retained on any later failure or interruption.
+  python3 -I - "$JOURNAL" "$cmd" <<'PY_JOURNAL'
+import json, os, sys
+with open(sys.argv[1], 'x') as f:
+    json.dump({'command': sys.argv[2], 'pid': os.getppid(), 'recovery': 'manual inspection required'}, f)
+    f.flush(); os.fsync(f.fileno())
+fd = os.open(os.path.dirname(sys.argv[1]), os.O_RDONLY)
+try: os.fsync(fd)
+finally: os.close(fd)
+PY_JOURNAL
 }
+finish_operation() { rm -- "$JOURNAL"; }
+
+# Stage known index paths only; preserve unrelated files and staged ownership.
+stage() { safety stage; }
+check_staged() {
+  local rc=0
+  g diff --cached --quiet || rc=$?
+  if [ "$rc" -gt 1 ]; then echo "ERROR: cannot inspect staged changes" >&2; exit "$rc"; fi
+  return "$rc"
+}
+
+
 usage() {
   cat <<'EOF'
 ccd-migrate — sync Claude Desktop session index between accounts.
@@ -51,31 +73,55 @@ case "$cmd" in
   *)          if [ $# -gt 0 ]; then shift; fi ;;
 esac
 
-[ -d "$GD" ] || { echo "ERROR: git repo $GD missing. Run install.sh first (it bootstraps the repo)." >&2; exit 1; }
-[ -d "$WT/claude-code-sessions" ] || { echo "ERROR: $WT/claude-code-sessions not found — is Claude Desktop installed and launched at least once?" >&2; exit 1; }
+case "$cmd" in
+  migrate) for arg in "$@"; do [ "$arg" = --dry-run ] || { echo "unknown argument: $arg" >&2; exit 2; }; done ;;
+  undo|snapshot|status) [ "$#" = 0 ] || { echo "unexpected argument" >&2; exit 2; } ;;
+  log) [ "$#" -le 1 ] && [[ "${1:-15}" =~ ^[0-9]+$ ]] || { echo "invalid log count" >&2; exit 2; } ;;
+  *) echo "unknown command: $cmd" >&2; exit 2 ;;
+esac
+[ -d "$GD" ] || { echo "ERROR: git repo missing. Run install.sh first." >&2; exit 1; }
+[ -d "$WT/claude-code-sessions" ] || { echo "ERROR: session root missing." >&2; exit 1; }
+DRY=0
+for arg in "$@"; do if [ "$arg" = --dry-run ]; then DRY=1; fi; done
+case "$cmd" in
+  migrate|undo|snapshot)
+    safety guard
+    if [ "$DRY" = 0 ]; then
+    mkdir "$LOCK" 2>/dev/null || { echo "ERROR: another operation or stale lock; inspect $LOCK manually" >&2; exit 1; }
+    trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    safety guard
+    fi
+    ;;
+esac
 
 case "$cmd" in
   log)      g log --oneline --stat -"${1:-15}"; exit 0 ;;
   undo)
+    # All candidate/history/conflict checks happen before staging drift.
+    mig=$(safety undo)
+    begin_operation
     stage
-    g diff --cached --quiet || g commit -q -m "drift: app-side changes before undo"
-    mig=$(g log --grep='^migrate:' --format=%H -1)
-    if [ -z "$mig" ]; then
-      echo "no 'migrate:' commit found — nothing to undo. Revert a specific commit manually:" >&2
-      echo "  git --git-dir=\"$GD\" --work-tree=\"$WT\" revert <hash>" >&2
-      exit 1
-    fi
-    g revert --no-edit "$mig"
-    echo "reverted: $(g log --pretty=%s -1 "$mig")  — fully quit and relaunch the Claude app to load it."
+    check_staged || g commit -q -m "drift: app-side changes before undo"
+    g -c revert.reference=false revert --no-edit "$mig"
+    finish_operation
+    echo "reverted: $(g log --pretty=%s -1 "$mig") — fully quit and relaunch the Claude app to load it."
     exit 0 ;;
-  snapshot) stage; g diff --cached --quiet && echo "clean — nothing to snapshot" || g commit -m "snapshot: manual"; exit 0 ;;
+  snapshot)
+    begin_operation
+    stage
+    if check_staged; then echo "clean — nothing to snapshot"; else g commit -m "snapshot: manual"; fi
+    finish_operation
+    exit 0 ;;
   status)
-    echo "owner: $(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]+"/cowork-enabled-cli-ops.json"))["ownerAccountId"])' "$WT" 2>/dev/null || echo '(unknown)')"
-    python3 - "$WT" <<'PY'
+    echo "owner: $(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]+"/cowork-enabled-cli-ops.json"))["ownerAccountId"])' "$WT" 2>/dev/null || echo '(unknown)')"
+    python3 -I - "$WT" <<'PY'
 import glob, os, sys, time
+from pathlib import Path
 WT = sys.argv[1]
-for org in sorted(glob.glob(os.path.join(WT, 'claude-code-sessions', '*', '*'))):
-    fs = glob.glob(os.path.join(org, 'local_*.json'))
+for org in sorted(str(p) for p in (Path(WT)/'claude-code-sessions').glob('*/*') if p.is_dir()):
+    fs = list(Path(org).glob('local_*.json'))
     newest = max((os.path.getmtime(f) for f in fs), default=0)
     ts = time.strftime('%m-%d %H:%M', time.localtime(newest)) if newest else 'empty'
     print(f"  {len(fs):>3} entries | newest {ts} | {'/'.join(org.split('/')[-2:])}")
@@ -89,32 +135,49 @@ esac
 DRY=0
 for a in "$@"; do if [ "$a" = "--dry-run" ]; then DRY=1; fi; done
 
-# 1) commit app-side drift first, so the migration diff is isolated
+# Validate direction and the complete plan before the first write. The planning
+# pass also catches missing owner metadata before drift can be staged.
+safety plan
 if [ "$DRY" = 0 ]; then
+  begin_operation
   stage
-  g diff --cached --quiet || g commit -q -m "drift: app-side changes before migrate"
+  check_staged || g commit -q -m "drift: app-side changes before migrate"
 fi
 
 # 2) plan + copy (tombstone-aware, newer-wins); python prints SUMMARY line last
-OUT=$(DRY=$DRY CCD_FROM="${CCD_FROM:-}" CCD_TO="${CCD_TO:-}" python3 - "$WT" <<'PY'
-import glob, json, os, re, shutil, sys, time
+OUT=$(DRY=$DRY CCD_FROM="${CCD_FROM:-}" CCD_TO="${CCD_TO:-}" python3 -I - "$WT" <<'PY'
+import glob, json, os, re, shutil, sys, time, tempfile
+from pathlib import Path
 WT = sys.argv[1]; DRY = os.environ.get('DRY') == '1'
 CCS = os.path.join(WT, 'claude-code-sessions'); LAM = os.path.join(WT, 'local-agent-mode-sessions')
-UUID = re.compile(r'^[0-9a-f]{8}-')
+UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f-]+$')
 try:
     owner = json.load(open(os.path.join(WT, 'cowork-enabled-cli-ops.json')))['ownerAccountId']
 except Exception as e:
     sys.exit(f"ERROR: cannot read ownerAccountId from cowork-enabled-cli-ops.json ({e}). Is Claude Desktop logged in?")
 
 def atomic_copy(s, dpath):  # temp+rename so Claude never sees a half-written index file
-    tmp = f"{dpath}.ccdtmp.{os.getpid()}"
-    shutil.copy2(s, tmp); os.replace(tmp, dpath)
-def newest(org): return max((os.path.getmtime(f) for f in glob.glob(os.path.join(org, 'local_*.json'))), default=0)
-def orgs(acct): return [d for d in glob.glob(os.path.join(CCS, acct, '*')) if os.path.isdir(d)]
+    fd, tmp = tempfile.mkstemp(prefix='.ccdtmp.', dir=os.path.dirname(dpath))
+    os.close(fd)
+    try:
+        shutil.copy2(s, tmp)
+        with open(tmp, 'rb') as staged:
+            value = json.load(staged, parse_constant=lambda value: (_ for _ in ()).throw(ValueError('non-finite JSON')))
+            if not isinstance(value, dict): raise ValueError('index must be a JSON object')
+            os.fsync(staged.fileno())
+        os.replace(tmp, dpath)
+        directory = os.open(os.path.dirname(dpath), os.O_RDONLY)
+        try: os.fsync(directory)
+        finally: os.close(directory)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+def index_files(org): return [str(p) for p in Path(org).glob('local_*.json') if p.is_file()]
+def newest(org): return max((os.path.getmtime(f) for f in index_files(org)), default=0)
+def orgs(acct): return [str(p) for p in (Path(CCS)/acct).iterdir() if p.is_dir()]
 def pick(acct_filter, label):
     cands = []
     for a in os.listdir(CCS):
-        if not UUID.match(a) or not acct_filter(a): continue
+        if not UUID.fullmatch(a) or not acct_filter(a): continue
         cands += orgs(a)
     if not cands: sys.exit(f"ERROR: no {label} account dir found under claude-code-sessions")
     return max(cands, key=newest)
@@ -125,7 +188,7 @@ dst_acct = os.path.basename(os.path.dirname(dst))
 src = pick((lambda a: a.startswith(FROM)) if FROM else (lambda a: a != dst_acct), 'source')
 if os.path.dirname(src) == os.path.dirname(dst): sys.exit("ERROR: src and dst are the same account (need a second account dir to migrate from)")
 if not FROM:
-    others = {a for a in os.listdir(CCS) if UUID.match(a) and a != dst_acct}
+    others = {a for a in os.listdir(CCS) if UUID.fullmatch(a) and a != dst_acct}
     if len(others) > 1:
         print(f"NOTE: {len(others)} non-destination accounts present; auto-picked {os.path.basename(os.path.dirname(src))[:8]} (newest activity). Override with CCD_FROM=<uuid-prefix>.")
 for role, d in (('destination', dst), ('source', src)):
@@ -135,17 +198,24 @@ for role, d in (('destination', dst), ('source', src)):
 
 tomb = set()
 tf = os.path.join(CCS, '.tombstones')
-if os.path.exists(tf): tomb = {l.strip() for l in open(tf) if l.strip()}
+if os.path.exists(tf): tomb = {l.strip() for l in open(tf, encoding='utf-8') if l.strip()}
 
-new = upd = skip_t = 0
-for f in sorted(glob.glob(os.path.join(src, 'local_*.json'))):
+new = upd = skip_t = skip_d = 0
+for f in sorted(index_files(src)):
     b = os.path.basename(f); d = os.path.join(dst, b)
     if b in tomb: skip_t += 1; continue
+    # Desktop markers are opaque intent. Presence wins; never delete or copy
+    # markers, and never interpret a source deletion as a target deletion.
+    entry = json.load(open(f, encoding='utf-8'))
+    ids = [b[len('local_'):-len('.json')], entry.get('cliSessionId')]
+    if os.path.isfile(d): ids.append(json.load(open(d, encoding='utf-8')).get('cliSessionId'))
+    if any(os.path.lexists(os.path.join(dst, 'deleted_' + ident)) for ident in ids if ident):
+        skip_d += 1; continue
     if not os.path.exists(d): act, new = 'NEW', new + 1
     elif os.path.getmtime(f) > os.path.getmtime(d) + 1: act, upd = 'UPD', upd + 1
     else: continue
     if DRY:
-        try: t = json.load(open(f)).get('title') or '(no title)'
+        try: t = json.dumps(entry.get('title') or '(no title)', ensure_ascii=True)
         except Exception: t = '(unparsable)'
         print(f"  {act} {b[:22]}… {t[:48]}")
     else: atomic_copy(f, d)
@@ -159,14 +229,14 @@ if os.path.isdir(lsrc):
     for e in sorted(os.listdir(lsrc)):
         p = os.path.join(lsrc, e); q = os.path.join(ldst, e)
         if e in ('rpm', 'cowork-gb-cache.json'): continue
-        if e.endswith('.json') and os.path.isfile(p):
+        if e.startswith('local_') and e.endswith('.json') and os.path.isfile(p):
             if not os.path.exists(q) or os.path.getmtime(p) > os.path.getmtime(q) + 1:
                 lamj += 1
                 if not DRY: atomic_copy(p, q)
         elif os.path.isdir(p) and e.startswith('local_') and not os.path.exists(q):
             lamd += 1
             if not DRY: shutil.copytree(p, q)
-print(f"SUMMARY src={sa[:8]}/{so[:8]} dst={da[:8]}/{do[:8]} new={new} upd={upd} lam_json={lamj} lam_dir={lamd} tombstone_skipped={skip_t}")
+print(f"SUMMARY src={sa[:8]}/{so[:8]} dst={da[:8]}/{do[:8]} new={new} upd={upd} lam_json={lamj} lam_dir={lamd} tombstone_skipped={skip_t} deleted_skipped={skip_d}")
 PY
 )
 echo "$OUT"
@@ -177,11 +247,12 @@ if [ "$DRY" = 1 ]; then
   echo "(dry run — nothing changed, nothing committed)"
 else
   stage
-  if g diff --cached --quiet; then
+  if check_staged; then
     echo "nothing to migrate — registries already in sync"
   else
     g commit -q -m "migrate: ${S#SUMMARY }"
     echo "committed: $(g log --oneline -1)"
     echo "Fully quit and relaunch the Claude app to load the merged list."
   fi
+  finish_operation
 fi
